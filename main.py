@@ -1,7 +1,7 @@
 #! /usr/bin/env python
 
+import argparse
 import os
-import time
 import sys
 
 import numpy as np
@@ -10,16 +10,15 @@ import torch.nn.functional as F
 from torch import nn, optim, cuda, backends
 from torch.autograd import Variable
 from torch.utils import data
-from torchvision import datasets, transforms
+from torchvision import datasets, transforms, utils
+
+parser = argparse.ArgumentParser()
+parser.add_argument('action', choices={'train', 'sample'})
+parser.add_argument('--feature-maps', type=int, default=32)
+parser.add_argument('--num-layers', type=int, default=4)
+parser.add_argument('--learning-rate', type=float, default=0.01)
+args = parser.parse_args()
 backends.cudnn.benchmark = True
-
-def tic():
-    cuda.synchronize()
-    return time.time()
-
-def toc(t):
-    cuda.synchronize()
-    return round(time.time() - t, 1)
 
 class MaskedConv2d(nn.Conv2d):
     def __init__(self, mask_type, *args, **kwargs):
@@ -32,35 +31,24 @@ class MaskedConv2d(nn.Conv2d):
         self.mask[:,:,kH // 2 + 1:] = 0
 
     def forward(self, x):
-        # self.weight.data *= self.mask
+        self.weight.data *= self.mask
         return super(MaskedConv2d, self).forward(x)
 
 
-fm = 32
-num_layers = 5
-action = 'train'
-
-layers = []
-for i in range(num_layers):
-    if i == 0:
-        layers.append(MaskedConv2d('A',  1, fm, 7, 1, 3, bias=False))
-    else:
-        layers.append(MaskedConv2d('B', fm, fm, 3, 1, 1, bias=False))
-    layers.extend([nn.InstanceNorm2d(fm), nn.ReLU(True)])
-layers.append(MaskedConv2d('B', fm, 256, 3, 1, 1))
+layers = [MaskedConv2d('A',  1, args.feature_maps, 7, 1, 3), nn.ReLU(True)]
+for i in range(args.num_layers):
+    layers.extend([MaskedConv2d('B', args.feature_maps, args.feature_maps, 7, 1, 3), nn.ReLU(True)])
+layers.append(MaskedConv2d('B', args.feature_maps, 256, 7, 1, 3))
 net = nn.Sequential(*layers)
 net.cuda()
 
 tr = data.DataLoader(datasets.MNIST('data', train=True, download=True, transform=transforms.ToTensor()),
                      batch_size=128, shuffle=True, num_workers=1, pin_memory=True)
 
-if action == 'train':
-    # train
-    optimizer = optim.Adam(net.parameters())
+if args.action == 'train':
+    optimizer = optim.SGD(net.parameters(), lr=args.learning_rate, momentum=0.9, nesterov=True)
     for epoch in range(10):
-
         err = []
-        tr_time = tic()
         for input, _ in tr:
             bs, _, w, h = input.size()
             input = Variable(input.cuda(async=True))
@@ -70,29 +58,16 @@ if action == 'train':
             optimizer.zero_grad()
             loss.backward()
             optimizer.step()
-        tr_time = toc(tr_time)
-
-        # test
-        input = torch.Tensor(32, 1, 28, 28).cuda()
-        input.fill_(0)
-        out = net(Variable(input, volatile=True))
-        print F.softmax(out[0,:,10,10])
-
-        print epoch, np.mean(err), tr_time
-
+        print epoch, np.mean(err)
         torch.save(net.state_dict(), 'net.pt')
 
-if action == 'sample':
-    # sample
+if args.action == 'sample':
     net.load_state_dict(torch.load('net.pt'))
-
-    input = torch.Tensor(32, 1, 28, 28).cuda()
-    input.fill_(0)
-
-    t = tic()
+    sample = torch.Tensor(64, 1, 28, 28).cuda()
+    sample.fill_(0)
     for i in range(28):
         for j in range(28):
-            out = net(Variable(input, volatile=True))
-            print F.softmax(out[0,:,10,10])
-            sys.exit()
-    print toc(t)
+            out = net(Variable(sample, volatile=True))
+            probs = F.softmax(out[:,:,i,j]).data
+            sample[:,:,i,j] = torch.multinomial(probs, 1).float() / 255.
+    utils.save_image(sample, 'sample.png')
