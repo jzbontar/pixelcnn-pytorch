@@ -1,6 +1,7 @@
 #! /usr/bin/env python
 
 import os
+import time
 import sys
 
 import numpy as np
@@ -27,39 +28,65 @@ class MaskedConv2d(nn.Conv2d):
         self.weight.data *= self.mask
         return super(MaskedConv2d, self).forward(x)
 
-fm = 32
+fm = 64
 net = nn.Sequential(
-    MaskedConv2d('A', 1,   fm, 7, 1, 3), nn.ReLU(True),
-    MaskedConv2d('B', fm,  fm, 7, 1, 3), nn.ReLU(True),
-    MaskedConv2d('B', fm,  fm, 7, 1, 3), nn.ReLU(True),
-    MaskedConv2d('B', fm,  fm, 7, 1, 3), nn.ReLU(True),
-    MaskedConv2d('B', fm,  fm, 7, 1, 3), nn.ReLU(True),
-    MaskedConv2d('B', fm, 256, 7, 1, 3))
+    MaskedConv2d('A', 1,  fm, 7, 1, 3, bias=False), nn.BatchNorm2d(fm), nn.ReLU(True),
+    MaskedConv2d('B', fm, fm, 7, 1, 3, bias=False), nn.BatchNorm2d(fm), nn.ReLU(True),
+    MaskedConv2d('B', fm, fm, 7, 1, 3, bias=False), nn.BatchNorm2d(fm), nn.ReLU(True),
+    MaskedConv2d('B', fm, fm, 7, 1, 3, bias=False), nn.BatchNorm2d(fm), nn.ReLU(True),
+    MaskedConv2d('B', fm, fm, 7, 1, 3, bias=False), nn.BatchNorm2d(fm), nn.ReLU(True),
+    MaskedConv2d('B', fm, fm, 7, 1, 3, bias=False), nn.BatchNorm2d(fm), nn.ReLU(True),
+    MaskedConv2d('B', fm, fm, 7, 1, 3, bias=False), nn.BatchNorm2d(fm), nn.ReLU(True),
+    MaskedConv2d('B', fm, fm, 7, 1, 3, bias=False), nn.BatchNorm2d(fm), nn.ReLU(True),
+    nn.Conv2d(fm, 256, 1))
+print net
 net.cuda()
 
 tr = data.DataLoader(datasets.MNIST('data', train=True, download=True, transform=transforms.ToTensor()),
                      batch_size=128, shuffle=True, num_workers=1, pin_memory=True)
+te = data.DataLoader(datasets.MNIST('data', train=False, download=True, transform=transforms.ToTensor()),
+                     batch_size=128, shuffle=False, num_workers=1, pin_memory=True)
 sample = torch.Tensor(144, 1, 28, 28).cuda()
-optimizer = optim.SGD(net.parameters(), lr=0.01, momentum=0.9, nesterov=True)
-for epoch in range(50):
+optimizer = optim.Adam(net.parameters())
+for epoch in range(25):
     # train
-    err = []
+    err_tr = []
+    cuda.synchronize()
+    time_tr = time.time()
+    net.train(True)
     for input, _ in tr:
         input = Variable(input.cuda(async=True))
         target = Variable((input.data[:,0] * 255).long())
         loss = F.cross_entropy(net(input), target)
-        err.append(loss.data[0])
+        err_tr.append(loss.data[0])
         optimizer.zero_grad()
         loss.backward()
         optimizer.step()
+    cuda.synchronize()
+    time_tr = time.time() - time_tr
+
+    # compute error on test set
+    err_te = []
+    cuda.synchronize()
+    time_te = time.time()
+    net.train(False)
+    for input, _ in te:
+        input = Variable(input.cuda(async=True), volatile=True)
+        target = Variable((input.data[:,0] * 255).long())
+        loss = F.cross_entropy(net(input), target)
+        err_te.append(loss.data[0])
+    cuda.synchronize()
+    time_te = time.time() - time_te
 
     # sample
     sample.fill_(0)
+    net.train(False)
     for i in range(28):
         for j in range(28):
             out = net(Variable(sample, volatile=True))
             probs = F.softmax(out[:, :, i, j]).data
             sample[:, :, i, j] = torch.multinomial(probs, 1).float() / 255.
-    utils.save_image(sample, 'sample_{:02d}.png'.format(epoch), nrow=12)
+    utils.save_image(sample, 'sample_{:02d}.png'.format(epoch), nrow=12, padding=0)
 
-    print epoch, np.mean(err)
+    print 'epoch={}; nll_tr={:.7f}; nll_te={:.7f}; time_tr={:.1f}s; time_te={:.1f}s'.format(
+        epoch, np.mean(err_tr), np.mean(err_te), time_tr, time_te)
